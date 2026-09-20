@@ -8,6 +8,7 @@ from app.negotiation import (
     ParticipantHeaderError,
     SampleHeaderError,
     analyze_q_stability,
+    assess_change_impact,
     negotiate,
     negotiate_group,
     normalize_fallbacks,
@@ -646,6 +647,122 @@ class TestCoveragePlan:
                 candidates=["fr-FR"],
                 max_additions=1,
             )
+        exc = excinfo.value
+        assert isinstance(exc, AcceptLanguageError)
+        assert exc.position == 2
+
+
+class TestChangeImpact:
+    def _assess(self, samples, **overrides):
+        kwargs = {
+            "samples": samples,
+            "before_supported": ["en-US", "zh-CN"],
+            "before_default": "en-US",
+            "after_supported": ["en-US", "zh-CN", "fr-FR"],
+            "after_default": "en-US",
+        }
+        kwargs.update(overrides)
+        return assess_change_impact(**kwargs)
+
+    def test_basic_aggregation_and_bucket_order(self):
+        result = self._assess(
+            [
+                ("fr", 100.0),  # fallback -> normal hit (exits fallback)
+                ("en", 200.0),  # unchanged normal hit
+                ("de", 50.0),  # fallback in both configs
+            ]
+        )
+        assert result["total_traffic"] == 350.0
+        assert result["changed_traffic"] == 100.0
+        assert result["fallback_entered_traffic"] == 0.0
+        assert result["fallback_exited_traffic"] == 100.0
+        # Buckets appear in first-appearance order across the samples.
+        assert result["transitions"] == [
+            {
+                "before_selected_language": "en-US",
+                "before_fallback": True,
+                "after_selected_language": "fr-FR",
+                "after_fallback": False,
+                "changed": True,
+                "traffic": 100.0,
+            },
+            {
+                "before_selected_language": "en-US",
+                "before_fallback": False,
+                "after_selected_language": "en-US",
+                "after_fallback": False,
+                "changed": False,
+                "traffic": 200.0,
+            },
+            {
+                "before_selected_language": "en-US",
+                "before_fallback": True,
+                "after_selected_language": "en-US",
+                "after_fallback": True,
+                "changed": False,
+                "traffic": 50.0,
+            },
+        ]
+
+    def test_repeated_buckets_accumulate_weight(self):
+        result = self._assess([("fr", 30.0), ("en", 10.0), ("fr", 70.0)])
+        assert len(result["transitions"]) == 2
+        assert result["transitions"][0]["traffic"] == 100.0
+        assert result["changed_traffic"] == 100.0
+
+    def test_removing_a_language_enters_fallback(self):
+        result = self._assess(
+            [("zh", 80.0)],
+            after_supported=["en-US"],
+        )
+        assert result["changed_traffic"] == 80.0
+        assert result["fallback_entered_traffic"] == 80.0
+        assert result["fallback_exited_traffic"] == 0.0
+        bucket = result["transitions"][0]
+        assert bucket["before_selected_language"] == "zh-CN"
+        assert bucket["before_fallback"] is False
+        assert bucket["after_selected_language"] == "en-US"
+        assert bucket["after_fallback"] is True
+
+    def test_default_language_change_counts_as_changed(self):
+        result = self._assess(
+            [(None, 10.0)],
+            after_default="zh-CN",
+        )
+        # Both sides fall back, but to different default languages.
+        assert result["changed_traffic"] == 10.0
+        assert result["fallback_entered_traffic"] == 0.0
+        assert result["fallback_exited_traffic"] == 0.0
+        bucket = result["transitions"][0]
+        assert bucket["before_fallback"] is True
+        assert bucket["after_fallback"] is True
+        assert bucket["changed"] is True
+
+    def test_locale_fallbacks_participate_per_config(self):
+        result = self._assess(
+            [("gsw", 40.0)],
+            before_supported=["en-US", "zh-TW"],
+            after_supported=["en-US", "zh-TW"],
+            before_locale_fallbacks={"gsw": "zh-TW"},
+        )
+        # before: chain gsw -> zh-TW is a normal hit; after (no chains):
+        # the default fallback kicks in.
+        assert result["changed_traffic"] == 40.0
+        assert result["fallback_entered_traffic"] == 40.0
+        bucket = result["transitions"][0]
+        assert bucket["before_selected_language"] == "zh-TW"
+        assert bucket["before_fallback"] is False
+        assert bucket["after_fallback"] is True
+
+    def test_traffic_sums_have_no_float_noise(self):
+        result = self._assess([("fr", 0.1), ("de", 0.2)])
+        assert result["total_traffic"] == 0.3
+        assert result["changed_traffic"] == 0.1
+        assert result["fallback_exited_traffic"] == 0.1
+
+    def test_invalid_sample_header_raises_with_position(self):
+        with pytest.raises(SampleHeaderError) as excinfo:
+            self._assess([("en", 1.0), ("fr;q=2", 1.0)])
         exc = excinfo.value
         assert isinstance(exc, AcceptLanguageError)
         assert exc.position == 2

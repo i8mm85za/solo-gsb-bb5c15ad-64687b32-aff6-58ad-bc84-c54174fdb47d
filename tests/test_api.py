@@ -1036,3 +1036,213 @@ def test_coverage_plan_extra_field_rejected_422():
         }
     )
     assert response.status_code == 422
+
+
+def _post_change_impact(payload):
+    return client.post("/api/v1/negotiate/change-impact", json=payload)
+
+
+def _change_impact_payload(**overrides):
+    payload = {
+        "samples": [
+            {"accept_language": "fr", "traffic": 100},
+            {"accept_language": "en", "traffic": 200},
+            {"accept_language": "de", "traffic": 50},
+        ],
+        "before": {
+            "supported_languages": ["en-US", "zh-CN"],
+            "default_language": "en-US",
+        },
+        "after": {
+            "supported_languages": ["en-US", "zh-CN", "fr-FR"],
+            "default_language": "en-US",
+        },
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_change_impact_basic():
+    response = _post_change_impact(_change_impact_payload())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_traffic"] == 350.0
+    assert body["changed_traffic"] == 100.0
+    assert body["fallback_entered_traffic"] == 0.0
+    assert body["fallback_exited_traffic"] == 100.0
+    # Buckets are listed in first-appearance order across the samples.
+    assert body["transitions"] == [
+        {
+            "before_selected_language": "en-US",
+            "before_fallback": True,
+            "after_selected_language": "fr-FR",
+            "after_fallback": False,
+            "changed": True,
+            "traffic": 100.0,
+        },
+        {
+            "before_selected_language": "en-US",
+            "before_fallback": False,
+            "after_selected_language": "en-US",
+            "after_fallback": False,
+            "changed": False,
+            "traffic": 200.0,
+        },
+        {
+            "before_selected_language": "en-US",
+            "before_fallback": True,
+            "after_selected_language": "en-US",
+            "after_fallback": True,
+            "changed": False,
+            "traffic": 50.0,
+        },
+    ]
+    # Bucket weights sum to the total; changed buckets to changed_traffic.
+    assert sum(t["traffic"] for t in body["transitions"]) == body["total_traffic"]
+    assert (
+        sum(t["traffic"] for t in body["transitions"] if t["changed"])
+        == body["changed_traffic"]
+    )
+
+
+def test_change_impact_enters_fallback_when_language_removed():
+    payload = _change_impact_payload(
+        samples=[{"accept_language": "zh", "traffic": 80}],
+        after={"supported_languages": ["en-US"], "default_language": "en-US"},
+    )
+    response = _post_change_impact(payload)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["changed_traffic"] == 80.0
+    assert body["fallback_entered_traffic"] == 80.0
+    assert body["fallback_exited_traffic"] == 0.0
+    bucket = body["transitions"][0]
+    assert bucket["before_selected_language"] == "zh-CN"
+    assert bucket["before_fallback"] is False
+    assert bucket["after_selected_language"] == "en-US"
+    assert bucket["after_fallback"] is True
+
+
+def test_change_impact_default_switch_counts_as_changed():
+    payload = _change_impact_payload(
+        samples=[{"traffic": 10}],
+        after={
+            "supported_languages": ["en-US", "zh-CN"],
+            "default_language": "zh-CN",
+        },
+    )
+    response = _post_change_impact(payload)
+    assert response.status_code == 200
+    body = response.json()
+    # Both sides fall back, but to different default languages.
+    assert body["changed_traffic"] == 10.0
+    assert body["fallback_entered_traffic"] == 0.0
+    assert body["fallback_exited_traffic"] == 0.0
+    bucket = body["transitions"][0]
+    assert bucket["before_fallback"] is True
+    assert bucket["after_fallback"] is True
+    assert bucket["changed"] is True
+
+
+def test_change_impact_locale_fallbacks_per_config():
+    payload = _change_impact_payload(
+        samples=[{"accept_language": "gsw", "traffic": 40}],
+        before={
+            "supported_languages": ["en-US", "zh-TW"],
+            "default_language": "en-US",
+            "locale_fallbacks": {"gsw": "zh-TW"},
+        },
+        after={
+            "supported_languages": ["en-US", "zh-TW"],
+            "default_language": "en-US",
+        },
+    )
+    response = _post_change_impact(payload)
+    assert response.status_code == 200
+    body = response.json()
+    # before: the gsw -> zh-TW chain is a normal hit; after (no chains):
+    # the sample falls back to the default language.
+    assert body["changed_traffic"] == 40.0
+    assert body["fallback_entered_traffic"] == 40.0
+    bucket = body["transitions"][0]
+    assert bucket["before_selected_language"] == "zh-TW"
+    assert bucket["before_fallback"] is False
+    assert bucket["after_fallback"] is True
+
+
+def test_change_impact_no_change_single_bucket():
+    payload = _change_impact_payload(
+        samples=[{"accept_language": "en", "traffic": 5}],
+        after={
+            "supported_languages": ["en-US", "zh-CN"],
+            "default_language": "en-US",
+        },
+    )
+    response = _post_change_impact(payload)
+    body = response.json()
+    assert body["changed_traffic"] == 0.0
+    assert len(body["transitions"]) == 1
+    assert body["transitions"][0]["changed"] is False
+
+
+def test_change_impact_invalid_sample_header_422():
+    payload = _change_impact_payload(
+        samples=[
+            {"accept_language": "en", "traffic": 1},
+            {"accept_language": "fr;q=2", "traffic": 1},
+        ]
+    )
+    response = _post_change_impact(payload)
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail[0]["loc"] == ["body", "samples", 1, "accept_language"]
+    assert detail[0]["type"] == "accept_language.syntax_error"
+
+
+def test_change_impact_negative_traffic_422():
+    payload = _change_impact_payload(
+        samples=[{"accept_language": "fr", "traffic": -1}]
+    )
+    assert _post_change_impact(payload).status_code == 422
+
+
+def test_change_impact_empty_samples_422():
+    payload = _change_impact_payload(samples=[])
+    assert _post_change_impact(payload).status_code == 422
+
+
+def test_change_impact_config_validation_422():
+    # before.default_language not in before.supported_languages.
+    payload = _change_impact_payload(
+        before={
+            "supported_languages": ["en-US"],
+            "default_language": "fr-FR",
+        }
+    )
+    response = _post_change_impact(payload)
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"][:2] == ["body", "before"]
+
+    # after.locale_fallbacks dangling chain, located inside "after".
+    payload = _change_impact_payload(
+        after={
+            "supported_languages": ["en-US", "zh-CN"],
+            "default_language": "en-US",
+            "locale_fallbacks": {"de": "xx", "xx": "yy"},
+        }
+    )
+    response = _post_change_impact(payload)
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail[0]["loc"] == ["body", "after", "locale_fallbacks"]
+    assert "悬空" in detail[0]["msg"]
+
+
+def test_change_impact_extra_field_rejected_422():
+    payload = _change_impact_payload()
+    payload["unexpected"] = 1
+    assert _post_change_impact(payload).status_code == 422
+
+    payload = _change_impact_payload()
+    payload["before"]["unexpected"] = 1
+    assert _post_change_impact(payload).status_code == 422

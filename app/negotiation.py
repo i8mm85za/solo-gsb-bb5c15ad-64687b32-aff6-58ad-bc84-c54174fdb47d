@@ -43,6 +43,15 @@ Implements the negotiation rules required by the service:
   the other ranges stay fixed, and finds the minimal single-range q
   change that makes the target the selected language; ties are broken
   by change amount, then header order, then the lower new q.
+* :func:`assess_change_impact` reuses :func:`negotiate` to preview a
+  language-configuration release: every traffic-weighted Accept-Language
+  sample is negotiated under the ``before`` and the ``after``
+  configuration (each with its own supported list, default language and
+  optional locale_fallbacks) and the two outcomes are compared by the
+  (selected_language, fallback) pair. The report aggregates the total,
+  changed, fallback-entered and fallback-exited traffic, plus the
+  before->after transition buckets with their weights in
+  first-appearance order.
 
 Language tag grammar follows RFC 5646 (BCP 47) primary tag grammar, which
 covers every ordinary language tag (the legacy "grandfathered" irregular
@@ -851,6 +860,133 @@ def plan_coverage(
         "improved_traffic": best_improved,
         "message": message,
         "samples": sample_reports,
+    }
+
+
+def assess_change_impact(
+    samples: list[tuple[str | None, float]],
+    before_supported: list[str],
+    before_default: str,
+    after_supported: list[str],
+    after_default: str,
+    before_locale_fallbacks: dict[str, str] | None = None,
+    after_locale_fallbacks: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Assess how a language-configuration change migrates traffic.
+
+    ``samples`` is a non-empty list of ``(accept_language, traffic)``
+    pairs with non-negative traffic. Every sample is evaluated with the
+    exact semantics of :func:`negotiate` twice: once under the
+    ``before`` configuration and once under the ``after`` configuration
+    (each carries its own supported list, default language and optional
+    locale_fallbacks chains). The two outcomes are compared by the
+    ``(selected_language, fallback)`` pair only.
+
+    The report aggregates:
+
+    * ``total_traffic``: sum of every sample's traffic;
+    * ``changed_traffic``: traffic whose (selected_language, fallback)
+      pair differs between before and after;
+    * ``fallback_entered_traffic``: traffic that is a normal hit before
+      but falls back to the default language after;
+    * ``fallback_exited_traffic``: traffic that falls back before but
+      is a normal hit after;
+    * ``transitions``: one bucket per observed
+      before->after outcome pair, in first-appearance order across the
+      samples, each carrying its accumulated ``traffic`` and a
+      ``changed`` flag. Bucket weights sum to ``total_traffic`` and the
+      changed buckets' weights sum to ``changed_traffic``.
+
+    Traffic sums absorb binary float noise via ``round(..., 6)``,
+    mirroring the coverage planner, so equal totals compare reliably.
+    A malformed sample header raises :class:`SampleHeaderError` with
+    the 1-based sample position.
+    """
+
+    total_traffic = 0.0
+    changed_traffic = 0.0
+    fallback_entered_traffic = 0.0
+    fallback_exited_traffic = 0.0
+    # Insertion-ordered dict: buckets are reported in the order their
+    # before->after pair first appears across the samples.
+    buckets: dict[tuple[str, bool, str, bool], float] = {}
+
+    for position, (header, traffic) in enumerate(samples, start=1):
+        try:
+            before = negotiate(
+                header=header,
+                supported=before_supported,
+                default=before_default,
+                locale_fallbacks=before_locale_fallbacks,
+            )
+            after = negotiate(
+                header=header,
+                supported=after_supported,
+                default=after_default,
+                locale_fallbacks=after_locale_fallbacks,
+            )
+        except AcceptLanguageError as exc:
+            raise SampleHeaderError(position, str(exc)) from exc
+
+        key = (
+            before["selected_language"],
+            before["fallback"],
+            after["selected_language"],
+            after["fallback"],
+        )
+        weight = float(traffic)
+        total_traffic += weight
+        buckets[key] = buckets.get(key, 0.0) + weight
+        if (key[0], key[1]) != (key[2], key[3]):
+            changed_traffic += weight
+        if not key[1] and key[3]:
+            fallback_entered_traffic += weight
+        elif key[1] and not key[3]:
+            fallback_exited_traffic += weight
+
+    transitions = [
+        {
+            "before_selected_language": before_selected,
+            "before_fallback": before_fallback,
+            "after_selected_language": after_selected,
+            "after_fallback": after_fallback,
+            "changed": (before_selected, before_fallback)
+            != (after_selected, after_fallback),
+            "traffic": round(bucket_traffic, 6),
+        }
+        for (
+            before_selected,
+            before_fallback,
+            after_selected,
+            after_fallback,
+        ), bucket_traffic in buckets.items()
+    ]
+
+    total_traffic = round(total_traffic, 6)
+    changed_traffic = round(changed_traffic, 6)
+    fallback_entered_traffic = round(fallback_entered_traffic, 6)
+    fallback_exited_traffic = round(fallback_exited_traffic, 6)
+
+    if changed_traffic:
+        message = (
+            f"共 {total_traffic:g} 流量，其中 {changed_traffic:g} 流量的"
+            f"协商结果在配置变更后发生变化：{fallback_entered_traffic:g} "
+            f"进入默认兜底、{fallback_exited_traffic:g} 离开默认兜底；"
+            f"按首次出现顺序共 {len(transitions)} 个转移桶"
+        )
+    else:
+        message = (
+            f"共 {total_traffic:g} 流量，配置变更后所有样本的协商结果"
+            f"均不变；按首次出现顺序共 {len(transitions)} 个转移桶"
+        )
+
+    return {
+        "total_traffic": total_traffic,
+        "changed_traffic": changed_traffic,
+        "fallback_entered_traffic": fallback_entered_traffic,
+        "fallback_exited_traffic": fallback_exited_traffic,
+        "message": message,
+        "transitions": transitions,
     }
 
 
