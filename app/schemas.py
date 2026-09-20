@@ -539,6 +539,134 @@ class CoveragePlanResponse(BaseModel):
     samples: list[CoverageSamplePlan]
 
 
+class LanguageConfig(BaseModel):
+    """One language configuration snapshot for change-impact assessment.
+
+    Mirrors the configuration fields of :class:`NegotiationRequest`
+    (same validation rules); ``before``/``after`` each carry their own
+    supported list, default language and optional locale_fallbacks.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    supported_languages: list[str] = Field(
+        min_length=1,
+        title="该配置下服务端支持的 BCP 47 语言标签（按优先级/稳定顺序排列）",
+    )
+    default_language: str = Field(
+        title="该配置的默认语言标签，必须包含在 supported_languages 中"
+    )
+    locale_fallbacks: dict[str, str] | None = Field(
+        default=None,
+        title="该配置可选的语言回退有向链（源标签 -> 下一标签）",
+        description="校验规则与单人协商接口的 locale_fallbacks 完全一致",
+    )
+
+    @field_validator("supported_languages")
+    @classmethod
+    def _validate_supported(cls, value: list[str]) -> list[str]:
+        return _check_supported_tags(value)
+
+    @field_validator("default_language")
+    @classmethod
+    def _validate_default(cls, value: str) -> str:
+        return _check_default_tag(value)
+
+    @field_validator("locale_fallbacks", mode="before")
+    @classmethod
+    def _validate_fallbacks_shape(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        try:
+            return normalize_fallbacks(value)
+        except LocaleFallbackError as exc:
+            raise ValueError(str(exc)) from exc
+
+    @field_validator("locale_fallbacks")
+    @classmethod
+    def _validate_fallback_chains(
+        cls, value: dict[str, str] | None, info: ValidationInfo
+    ) -> dict[str, str] | None:
+        # Runs after supported_languages/default_language validators
+        # (field declaration order), so topology errors are located at
+        # ["body", "<before|after>", "locale_fallbacks"].
+        if value is not None and info.data.get("supported_languages"):
+            try:
+                validate_fallback_chains(value, info.data["supported_languages"])
+            except LocaleFallbackError as exc:
+                raise ValueError(str(exc)) from exc
+        return value
+
+    @model_validator(mode="after")
+    def _default_must_be_supported(self) -> "LanguageConfig":
+        _check_default_in_supported(self.supported_languages, self.default_language)
+        return self
+
+
+class ChangeImpactRequest(BaseModel):
+    """Change-impact assessment input.
+
+    ``samples`` are traffic-weighted Accept-Language headers; ``before``
+    and ``after`` are the two language configurations to compare. Every
+    sample is negotiated against both configurations with the exact
+    semantics of the single negotiation endpoint.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    samples: list[CoverageSample] = Field(
+        min_length=1,
+        title="带非负 traffic 的 Accept-Language 样本（至少 1 个）",
+    )
+    before: LanguageConfig = Field(title="发布前的语言配置")
+    after: LanguageConfig = Field(title="待发布的语言配置")
+
+
+class ChangeImpactTransition(BaseModel):
+    """One before -> after outcome bucket with its summed traffic weight."""
+
+    before_selected_language: str = Field(description="变更前选中的语言")
+    before_fallback: bool = Field(description="变更前是否回退到默认语言")
+    after_selected_language: str = Field(description="变更后选中的语言")
+    after_fallback: bool = Field(description="变更后是否回退到默认语言")
+    traffic: float = Field(description="落入该转移桶的样本流量之和")
+
+
+class ChangeImpactSampleReport(BaseModel):
+    position: int = Field(description="在 samples 数组中的序号（从 1 开始）")
+    traffic: float = Field(description="该样本的流量（原样回显）")
+    before_selected_language: str = Field(description="变更前选中的语言")
+    before_fallback: bool = Field(description="变更前是否回退到默认语言")
+    after_selected_language: str = Field(description="变更后选中的语言")
+    after_fallback: bool = Field(description="变更后是否回退到默认语言")
+    changed: bool = Field(
+        description="选中语言或默认兜底状态是否发生变化"
+    )
+
+
+class ChangeImpactResponse(BaseModel):
+    total_traffic: float = Field(description="全部样本流量之和")
+    changed_traffic: float = Field(
+        description="协商结果（选中语言或默认兜底状态）发生变化的流量"
+    )
+    fallback_entered_traffic: float = Field(
+        description="由正常命中变为默认兜底的流量"
+    )
+    fallback_left_traffic: float = Field(
+        description="由默认兜底变为正常命中的流量"
+    )
+    message: str
+    transitions: list[ChangeImpactTransition] = Field(
+        description=(
+            "before -> after 转移桶（按首次出现顺序），权重为落入桶内的"
+            "样本流量之和；所有桶权重之和恒等于 total_traffic"
+        )
+    )
+    samples: list[ChangeImpactSampleReport] = Field(
+        description="逐样本的变更前后协商结果明细"
+    )
+
+
 class HealthResponse(BaseModel):
     status: Literal["ok"] = "ok"
     service: str

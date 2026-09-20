@@ -13,12 +13,15 @@ from .negotiation import (
     ParticipantHeaderError,
     SampleHeaderError,
     analyze_q_stability,
+    assess_change_impact,
     negotiate,
     negotiate_group,
     plan_coverage,
     steer_q,
 )
 from .schemas import (
+    ChangeImpactRequest,
+    ChangeImpactResponse,
     CoveragePlanRequest,
     CoveragePlanResponse,
     GroupNegotiationRequest,
@@ -42,6 +45,11 @@ app = FastAPI(
         "服务端顺序选出共同接受的语言。"
         "另提供 /api/v1/negotiate/q-steer 目标引导：对去重后的每个语言范围单独"
         "扫描三位小数 q 网格，找出让指定目标语言胜出的最小单项 q 改动。"
+        "另提供 /api/v1/negotiate/change-impact 变更影响评估：对带非负 traffic 的"
+        " Accept-Language 样本逐条复用单人协商，比较 before/after 两套语言配置"
+        "（各自含 supported_languages、default_language 与可选 locale_fallbacks）"
+        "下“选中语言+是否默认兜底”的变化，汇总总流量、变化流量、进出兜底流量及"
+        " before→after 转移桶。"
     ),
     version=__version__,
 )
@@ -260,6 +268,27 @@ async def negotiate_coverage_plan(
     return CoveragePlanResponse.model_validate(result)
 
 
+@app.post(
+    "/api/v1/negotiate/change-impact",
+    response_model=ChangeImpactResponse,
+    tags=["语言协商"],
+    summary="语言配置发布前的流量迁移影响评估",
+)
+async def negotiate_change_impact(
+    payload: ChangeImpactRequest,
+) -> ChangeImpactResponse:
+    result = assess_change_impact(
+        samples=[(s.accept_language, s.traffic) for s in payload.samples],
+        before_supported=payload.before.supported_languages,
+        before_default=payload.before.default_language,
+        before_fallbacks=payload.before.locale_fallbacks,
+        after_supported=payload.after.supported_languages,
+        after_default=payload.after.default_language,
+        after_fallbacks=payload.after.locale_fallbacks,
+    )
+    return ChangeImpactResponse.model_validate(result)
+
+
 @app.get("/", tags=["元信息"])
 async def root() -> dict[str, str]:
     return {
@@ -271,4 +300,5 @@ async def root() -> dict[str, str]:
         "negotiate_q_stability": "POST /api/v1/negotiate/q-stability",
         "negotiate_q_steer": "POST /api/v1/negotiate/q-steer",
         "negotiate_group": "POST /api/v1/negotiate/group",
+        "negotiate_change_impact": "POST /api/v1/negotiate/change-impact",
     }

@@ -18,7 +18,11 @@ traffic 的 `Accept-Language` 流量样本与 1～12 个候选新增语言，穷
 `/api/v1/negotiate/q-steer` 提供**目标语言引导**：在单人协商请求上增加
 `target_language`，服务端同样逐范围扫描三位小数 q 网格，找出让目标语言胜出的
 **最小单项 q 改动**（按改变量、头部顺序、较低新 q 依次决胜），并给出基准与调整后的
-完整协商结果。
+完整协商结果。`/api/v1/negotiate/change-impact` 提供**变更影响评估**：在语言配置
+发布前，给定一组带非负 traffic 的 `Accept-Language` 流量样本与 `before`/`after`
+两套配置（各自含支持列表、默认语言与可选 `locale_fallbacks`），逐样本复用单人协商
+语义，按「选中语言 + 是否默认兜底」比较变更前后结果，汇总总流量、结果变化流量、
+进入/离开兜底流量，并按首次出现顺序列出 before→after 转移桶及权重。
 
 技术栈：Python 3.12 · FastAPI · Pydantic v2 · Uvicorn，依赖在容器构建时安装。
 
@@ -38,6 +42,7 @@ docker compose up -d --build
 | http://localhost:8000/api/v1/negotiate/q-steer | 目标语言引导接口（`POST`） |
 | http://localhost:8000/api/v1/negotiate/group | 群体语言协商接口（`POST`） |
 | http://localhost:8000/api/v1/negotiate/coverage-plan | 候选语言覆盖规划接口（`POST`） |
+| http://localhost:8000/api/v1/negotiate/change-impact | 语言配置变更影响评估接口（`POST`） |
 | http://localhost:8000/docs | Swagger UI 交互式文档 |
 | http://localhost:8000/openapi.json | OpenAPI 3 描述 |
 
@@ -558,6 +563,109 @@ curl -X POST http://localhost:8000/api/v1/negotiate/coverage-plan \
 `accept_language.syntax_error`），以及沿用单人接口的
 `supported_languages` / `default_language` 校验。
 
+## 变更影响评估（POST /api/v1/negotiate/change-impact）
+
+语言配置（支持列表、默认语言、`locale_fallbacks`）发布前，需要回答「这次变更会让
+多少流量的协商结果发生变化、有多少流量进入/离开默认兜底？」。变更影响评估接口接收
+一组带非负 `traffic` 的 `Accept-Language` 流量样本，以及 `before` / `after` 两套
+语言配置，**逐样本复用与单人接口完全相同的协商语义**各协商一次，按
+「**选中语言 + 是否默认兜底**」比较变更前后结果，输出流量迁移汇总。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/negotiate/change-impact \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "samples": [
+      {"accept_language": "zh-CN,zh;q=0.9", "traffic": 500},
+      {"accept_language": "fr-FR,fr;q=0.9", "traffic": 320.5},
+      {"accept_language": "de", "traffic": 210},
+      {"traffic": 45},
+      {"accept_language": "en", "traffic": 100}
+    ],
+    "before": {
+      "supported_languages": ["en-US", "zh-CN"],
+      "default_language": "en-US"
+    },
+    "after": {
+      "supported_languages": ["en-US", "zh-CN", "fr-FR"],
+      "default_language": "zh-CN"
+    }
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "total_traffic": 1175.5,
+  "changed_traffic": 575.5,
+  "fallback_entered_traffic": 0.0,
+  "fallback_left_traffic": 320.5,
+  "message": "共评估 1175.5 流量：575.5 流量的协商结果（选中语言或默认兜底状态）发生变化，其中 0 由正常命中进入默认兜底、320.5 由默认兜底转为正常命中",
+  "transitions": [
+    {"before_selected_language": "zh-CN", "before_fallback": false,
+     "after_selected_language": "zh-CN", "after_fallback": false,
+     "traffic": 500.0},
+    {"before_selected_language": "en-US", "before_fallback": true,
+     "after_selected_language": "fr-FR", "after_fallback": false,
+     "traffic": 320.5},
+    {"before_selected_language": "en-US", "before_fallback": true,
+     "after_selected_language": "zh-CN", "after_fallback": true,
+     "traffic": 255.0},
+    {"before_selected_language": "en-US", "before_fallback": false,
+     "after_selected_language": "en-US", "after_fallback": false,
+     "traffic": 100.0}
+  ],
+  "samples": [
+    {"position": 2, "traffic": 320.5,
+     "before_selected_language": "en-US", "before_fallback": true,
+     "after_selected_language": "fr-FR", "after_fallback": false,
+     "changed": true}
+  ]
+}
+```
+
+上例中：样本 1（zh）与样本 5（en）在变更前后命中同一语言，结果不变；样本 2（fr）
+由默认兜底转为正常命中 `fr-FR`；样本 3（de）与样本 4（无请求头）变更前兜底到
+`en-US`，变更后兜底到新的默认语言 `zh-CN`——兜底状态未变但选中语言变了，仍计入
+`changed_traffic`。
+
+### 变更影响请求体
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `samples` | object[] | 是 | 至少 1 个样本；`accept_language` 可缺省/`null`，`traffic` 为非负数值 |
+| `before` | object | 是 | 发布前配置：`supported_languages`、`default_language`、可选 `locale_fallbacks` |
+| `after` | object | 是 | 待发布配置，字段与校验规则同 `before` |
+
+`before` / `after` 的每个字段（支持列表至少 1 个且不可重复、默认语言必须在支持
+列表中、`locale_fallbacks` 的标签/重复源/环路/悬空链校验）都与单人协商接口完全
+一致，校验错误的 `loc` 形如 `["body","after","locale_fallbacks"]`。
+
+### 评估规则与响应字段
+
+1. **逐样本双人协商**：每个样本分别用 `before`、`after` 配置按单人接口语义协商
+   （含各自的 `locale_fallbacks` 链），得到「选中语言 + 是否默认兜底」的结果对；
+   两者任一不同即视为**变化**。
+2. **流量汇总**：`total_traffic` 为全部样本流量之和；`changed_traffic` 为结果
+   变化样本的流量之和；`fallback_entered_traffic` / `fallback_left_traffic`
+   分别为「正常命中 → 默认兜底」「默认兜底 → 正常命中」的流量（均按变更后/前的
+   `fallback` 状态判定，是 `changed_traffic` 的子集）。
+3. **转移桶**：`transitions[]` 按**首次出现顺序**列出所有 before→after 结果桶
+   （含未变化的桶），每桶给出变更前后选中语言、兜底状态与桶内样本流量之和
+   `traffic`；所有桶权重之和恒等于 `total_traffic`。
+4. **逐样本明细**：`samples[]` 按输入顺序给出每个样本变更前后的选中语言
+   （`before_selected_language` / `after_selected_language`）、兜底状态
+   （`before_fallback` / `after_fallback`）与是否变化（`changed`）。
+5. 缺省/`null`/空白的 `accept_language` 视为无有效范围：在两套配置下都走默认
+   兜底；若默认语言本身被改动，该样本仍可能计入 `changed_traffic`。
+
+校验（均返回 **HTTP 422**）：`samples` 为空、`traffic` 为负数或 NaN/无穷、
+某样本的 `accept_language` 语法非法（`loc` 形如
+`["body","samples",1,"accept_language"]`，`type` 为
+`accept_language.syntax_error`）、`before`/`after` 配置非法，以及请求体携带
+多余字段。
+
 ## 协商规则
 
 1. **q 权重**：遵循 RFC 9110，缺省 `q=1`；合法写法为 `0`–`1`、最多 3 位小数
@@ -645,7 +753,7 @@ docker run --rm -p 8000:8000 -e UVICORN_WORKERS=2 language-negotiator
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8000
-pytest -q          # 172 个单元/接口测试
+pytest -q          # 187 个单元/接口测试
 ```
 
 ## 项目结构

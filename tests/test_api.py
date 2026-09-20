@@ -1036,3 +1036,210 @@ def test_coverage_plan_extra_field_rejected_422():
         }
     )
     assert response.status_code == 422
+
+
+def _post_change_impact(payload):
+    return client.post("/api/v1/negotiate/change-impact", json=payload)
+
+
+def _change_impact_payload(**overrides):
+    payload = {
+        "samples": [
+            {"accept_language": "zh-CN,zh;q=0.9", "traffic": 500},
+            {"accept_language": "fr-FR,fr;q=0.9", "traffic": 320.5},
+            {"accept_language": "de", "traffic": 210},
+            {"traffic": 45},
+            {"accept_language": "en", "traffic": 100},
+        ],
+        "before": {
+            "supported_languages": ["en-US", "zh-CN"],
+            "default_language": "en-US",
+        },
+        "after": {
+            "supported_languages": ["en-US", "zh-CN", "fr-FR"],
+            "default_language": "zh-CN",
+        },
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_change_impact_basic():
+    response = _post_change_impact(_change_impact_payload())
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_traffic"] == 1175.5
+    # fr converts to a normal hit; de and the headerless sample keep
+    # falling back but land on the new default zh-CN.
+    assert body["changed_traffic"] == 575.5
+    assert body["fallback_entered_traffic"] == 0.0
+    assert body["fallback_left_traffic"] == 320.5
+    # Buckets are listed in first-appearance order and their weights
+    # add up to the total traffic.
+    assert [
+        (
+            t["before_selected_language"],
+            t["before_fallback"],
+            t["after_selected_language"],
+            t["after_fallback"],
+            t["traffic"],
+        )
+        for t in body["transitions"]
+    ] == [
+        ("zh-CN", False, "zh-CN", False, 500.0),
+        ("en-US", True, "fr-FR", False, 320.5),
+        ("en-US", True, "zh-CN", True, 255.0),
+        ("en-US", False, "en-US", False, 100.0),
+    ]
+    assert (
+        sum(t["traffic"] for t in body["transitions"]) == body["total_traffic"]
+    )
+    samples = body["samples"]
+    assert [s["position"] for s in samples] == [1, 2, 3, 4, 5]
+    assert [s["changed"] for s in samples] == [False, True, True, True, False]
+    assert samples[1]["before_selected_language"] == "en-US"
+    assert samples[1]["before_fallback"] is True
+    assert samples[1]["after_selected_language"] == "fr-FR"
+    assert samples[1]["after_fallback"] is False
+    assert samples[3]["traffic"] == 45.0
+
+
+def test_change_impact_fallback_entry_and_exit():
+    response = _post_change_impact(
+        _change_impact_payload(
+            samples=[
+                {"accept_language": "fr", "traffic": 80},
+                {"accept_language": "zh", "traffic": 60},
+                {"accept_language": "en", "traffic": 10},
+            ],
+            before={
+                "supported_languages": ["en-US", "fr-FR"],
+                "default_language": "en-US",
+            },
+            after={
+                "supported_languages": ["en-US", "zh-CN"],
+                "default_language": "en-US",
+            },
+        )
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total_traffic"] == 150.0
+    assert body["changed_traffic"] == 140.0
+    # fr loses its normal hit and falls back; zh gains one.
+    assert body["fallback_entered_traffic"] == 80.0
+    assert body["fallback_left_traffic"] == 60.0
+
+
+def test_change_impact_locale_fallbacks_per_config():
+    response = _post_change_impact(
+        _change_impact_payload(
+            samples=[{"accept_language": "gsw;q=0.9", "traffic": 50}],
+            before={
+                "supported_languages": ["en-US", "zh-CN"],
+                "default_language": "en-US",
+            },
+            after={
+                "supported_languages": ["en-US", "zh-CN"],
+                "default_language": "en-US",
+                "locale_fallbacks": {"gsw": "zh-CN"},
+            },
+        )
+    )
+    assert response.status_code == 200
+    body = response.json()
+    sample = body["samples"][0]
+    assert sample["before_fallback"] is True
+    # The after config's chain selects zh-CN: not a default fallback.
+    assert sample["after_selected_language"] == "zh-CN"
+    assert sample["after_fallback"] is False
+    assert body["fallback_left_traffic"] == 50.0
+
+
+def test_change_impact_identical_configs_no_change():
+    response = _post_change_impact(
+        _change_impact_payload(
+            samples=[{"accept_language": "zh", "traffic": 5}],
+            before={
+                "supported_languages": ["en-US", "zh-CN"],
+                "default_language": "en-US",
+            },
+            after={
+                "supported_languages": ["en-US", "zh-CN"],
+                "default_language": "en-US",
+            },
+        )
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["changed_traffic"] == 0.0
+    assert body["fallback_entered_traffic"] == 0.0
+    assert body["fallback_left_traffic"] == 0.0
+    assert all(not s["changed"] for s in body["samples"])
+
+
+def test_change_impact_invalid_sample_header_422():
+    response = _post_change_impact(
+        _change_impact_payload(
+            samples=[
+                {"accept_language": "en", "traffic": 1},
+                {"accept_language": "fr;q=2", "traffic": 1},
+            ]
+        )
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail[0]["loc"] == ["body", "samples", 1, "accept_language"]
+    assert detail[0]["type"] == "accept_language.syntax_error"
+
+
+def test_change_impact_negative_traffic_422():
+    response = _post_change_impact(
+        _change_impact_payload(
+            samples=[{"accept_language": "fr", "traffic": -1}]
+        )
+    )
+    assert response.status_code == 422
+
+
+def test_change_impact_empty_samples_422():
+    response = _post_change_impact(_change_impact_payload(samples=[]))
+    assert response.status_code == 422
+
+
+def test_change_impact_invalid_before_after_config_422():
+    # after.default_language not in after.supported_languages.
+    response = _post_change_impact(
+        _change_impact_payload(
+            after={
+                "supported_languages": ["en-US", "zh-CN"],
+                "default_language": "fr-FR",
+            }
+        )
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"] == ["body", "after"]
+
+    # Dangling locale_fallbacks chain inside before.
+    response = _post_change_impact(
+        _change_impact_payload(
+            before={
+                "supported_languages": ["en-US"],
+                "default_language": "en-US",
+                "locale_fallbacks": {"de": "xx"},
+            }
+        )
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail[0]["loc"] == ["body", "before", "locale_fallbacks"]
+    assert "悬空" in detail[0]["msg"]
+
+
+def test_change_impact_extra_field_rejected_422():
+    payload = _change_impact_payload()
+    payload["unexpected"] = 1
+    assert _post_change_impact(payload).status_code == 422
+    payload = _change_impact_payload()
+    payload["before"]["unexpected"] = 1
+    assert _post_change_impact(payload).status_code == 422

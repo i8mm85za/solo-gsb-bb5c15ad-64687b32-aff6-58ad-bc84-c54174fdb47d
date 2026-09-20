@@ -43,6 +43,14 @@ Implements the negotiation rules required by the service:
   the other ranges stay fixed, and finds the minimal single-range q
   change that makes the target the selected language; ties are broken
   by change amount, then header order, then the lower new q.
+* :func:`assess_change_impact` reuses :func:`negotiate` per sample for
+  pre-publish migration assessment: every traffic-weighted
+  Accept-Language sample is negotiated against a ``before`` and an
+  ``after`` configuration (each with its own supported list, default
+  language and optional locale_fallbacks); per-sample outcomes are
+  compared by the (selected_language, fallback) pair and aggregated
+  into total / changed / fallback-entering / fallback-leaving traffic,
+  plus before -> after transition buckets in first-appearance order.
 
 Language tag grammar follows RFC 5646 (BCP 47) primary tag grammar, which
 covers every ordinary language tag (the legacy "grandfathered" irregular
@@ -850,6 +858,138 @@ def plan_coverage(
         "baseline_fallback_traffic": baseline_fallback_traffic,
         "improved_traffic": best_improved,
         "message": message,
+        "samples": sample_reports,
+    }
+
+
+def assess_change_impact(
+    samples: list[tuple[str | None, float]],
+    before_supported: list[str],
+    before_default: str,
+    after_supported: list[str],
+    after_default: str,
+    before_fallbacks: dict[str, str] | None = None,
+    after_fallbacks: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Assess how republishing a language configuration migrates traffic.
+
+    ``samples`` is a non-empty list of ``(accept_language, traffic)``
+    pairs with non-negative traffic. Every sample is negotiated twice
+    with the exact semantics of :func:`negotiate`: once against the
+    ``before_*`` configuration and once against the ``after_*``
+    configuration (each with its own optional ``locale_fallbacks``
+    chains). A sample's outcome is the pair ``(selected_language,
+    fallback)`` -- the selected server tag plus whether it was reached
+    via the default-language fallback; the sample counts as *changed*
+    when the before/after pairs differ.
+
+    The report aggregates the total traffic, the changed traffic, the
+    traffic entering the default fallback (normal hit -> fallback) and
+    the traffic leaving it (fallback -> normal hit), and groups samples
+    into before -> after transition buckets listed in first-appearance
+    order, each carrying its summed traffic weight (bucket weights add
+    up to the total traffic). Traffic sums absorb binary float noise
+    via round(..., 6), mirroring the coverage planner.
+    """
+
+    sample_reports: list[dict[str, Any]] = []
+    # Insertion-ordered dict: buckets come out in first-appearance order.
+    buckets: dict[tuple[str, bool, str, bool], float] = {}
+    total_traffic = 0.0
+    changed_traffic = 0.0
+    fallback_entered_traffic = 0.0
+    fallback_left_traffic = 0.0
+
+    for position, (header, traffic) in enumerate(samples, start=1):
+        try:
+            before = negotiate(
+                header=header,
+                supported=before_supported,
+                default=before_default,
+                locale_fallbacks=before_fallbacks,
+            )
+            after = negotiate(
+                header=header,
+                supported=after_supported,
+                default=after_default,
+                locale_fallbacks=after_fallbacks,
+            )
+        except AcceptLanguageError as exc:
+            raise SampleHeaderError(position, str(exc)) from exc
+
+        before_selected = before["selected_language"]
+        before_fallback = before["fallback"]
+        after_selected = after["selected_language"]
+        after_fallback = after["fallback"]
+        changed = (before_selected, before_fallback) != (
+            after_selected,
+            after_fallback,
+        )
+
+        weight = float(traffic)
+        total_traffic += weight
+        if changed:
+            changed_traffic += weight
+        if not before_fallback and after_fallback:
+            fallback_entered_traffic += weight
+        if before_fallback and not after_fallback:
+            fallback_left_traffic += weight
+
+        bucket_key = (
+            before_selected,
+            before_fallback,
+            after_selected,
+            after_fallback,
+        )
+        buckets[bucket_key] = buckets.get(bucket_key, 0.0) + weight
+
+        sample_reports.append(
+            {
+                "position": position,
+                "traffic": traffic,
+                "before_selected_language": before_selected,
+                "before_fallback": before_fallback,
+                "after_selected_language": after_selected,
+                "after_fallback": after_fallback,
+                "changed": changed,
+            }
+        )
+
+    total_traffic = round(total_traffic, 6)
+    changed_traffic = round(changed_traffic, 6)
+    fallback_entered_traffic = round(fallback_entered_traffic, 6)
+    fallback_left_traffic = round(fallback_left_traffic, 6)
+
+    transitions = [
+        {
+            "before_selected_language": before_selected,
+            "before_fallback": before_fallback,
+            "after_selected_language": after_selected,
+            "after_fallback": after_fallback,
+            "traffic": round(weight, 6),
+        }
+        for (
+            before_selected,
+            before_fallback,
+            after_selected,
+            after_fallback,
+        ), weight in buckets.items()
+    ]
+
+    message = (
+        f"共评估 {total_traffic:g} 流量：{changed_traffic:g} 流量的"
+        "协商结果（选中语言或默认兜底状态）发生变化，其中 "
+        f"{fallback_entered_traffic:g} 由正常命中进入默认兜底、"
+        f"{fallback_left_traffic:g} 由默认兜底转为正常命中"
+    )
+
+    return {
+        "total_traffic": total_traffic,
+        "changed_traffic": changed_traffic,
+        "fallback_entered_traffic": fallback_entered_traffic,
+        "fallback_left_traffic": fallback_left_traffic,
+        "message": message,
+        "transitions": transitions,
         "samples": sample_reports,
     }
 
